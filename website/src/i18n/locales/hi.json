@@ -11936,6 +11936,7 @@
         "on_demand_skills_loaded_when_the_agent_determine": "ऑन-डिमांड स्किल, जो एजेंट को प्रासंगिक लगने पर लोड होती हैं।",
         "package": "पैकेज",
         "pending_review_count": "समीक्षा लंबित ({{count}})",
+        "pending_review_could_not_be_loaded": "समीक्षा लंबित सूची लोड नहीं हो सकी।",
         "pointer": "पॉइंटर",
         "proposed_change": "प्रस्तावित बदलाव",
         "refresh_skills": "स्किल रीफ़्रेश करें",

@@ -11766,6 +11766,7 @@
         "on_demand_skills_loaded_when_the_agent_determine": "エージェントが関連性があると判断したときにオンデマンドスキルを読み込みます。",
         "package": "パッケージ",
         "pending_review_count": "レビュー待ち ({{count}})",
+        "pending_review_could_not_be_loaded": "レビュー待ちを読み込めませんでした。",
         "pointer": "ポインタ",
         "proposed_change": "提案された変更",
         "refresh_skills": "スキルを更新",

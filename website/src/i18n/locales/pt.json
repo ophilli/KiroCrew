@@ -12106,6 +12106,7 @@
         "on_demand_skills_loaded_when_the_agent_determine": "Habilidades sob demanda, carregadas quando o agente determina que são relevantes.",
         "package": "Pacote",
         "pending_review_count": "Aguardando revisão ({{count}})",
+        "pending_review_could_not_be_loaded": "Não foi possível carregar a fila aguardando revisão.",
         "pointer": "ponteiro",
         "proposed_change": "Mudança proposta",
         "refresh_skills": "Atualizar habilidades",

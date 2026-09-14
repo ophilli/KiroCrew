@@ -12106,6 +12106,7 @@
         "on_demand_skills_loaded_when_the_agent_determine": "Habilidades a demanda que se cargan cuando el agente determina que son relevantes.",
         "package": "Paquete",
         "pending_review_count": "Pendientes de revisión ({{count}})",
+        "pending_review_could_not_be_loaded": "No se pudo cargar la lista de pendientes de revisión.",
         "pointer": "puntero",
         "proposed_change": "Cambio propuesto",
         "refresh_skills": "Actualizar habilidades",

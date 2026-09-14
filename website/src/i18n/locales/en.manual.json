@@ -4892,6 +4892,7 @@
         "loaded_by_2": "Loaded by: {{agents}}",
         "no_skills_match_query": "No skills match “{{query}}”.",
         "pending_review_count": "Pending review ({{count}})",
+        "pending_review_could_not_be_loaded": "Pending review could not be loaded.",
         "select": "Select {{name}}",
         "skills_count": "Skills ({{count}})",
         "skills_from_read_only": "Skills from {{name}} — read-only",
