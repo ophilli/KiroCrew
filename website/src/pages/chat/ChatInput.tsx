@@ -1,5 +1,7 @@
-import { openActivityToTab } from '../../store/chatSlice'
+import { openActivityToTab, sideSendStatus } from '../../store/chatSlice'
 import { api } from '../../api/client'
+import { AcceptedBodyUnreadable } from '../../api/apiError'
+import { deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import type { AppDispatch } from '../../store'
 
 /** `failed` marks a command that was recognized but could not run (no slot,
@@ -9,9 +11,14 @@ import type { AppDispatch } from '../../store'
  *  backend's own message, when it gave one) so the refusal is not silent.
  *  `stage` says WHAT failed: `open` (no panel) vs `turn` (the panel opened,
  *  only the message was refused) — the caller's title must match the state
- *  the user can see. */
+ *  the user can see.
+ *  `unconfirmed` is the one `failed` that is NOT a refusal: the turn answered
+ *  2xx but its receipt could not be read. The composer is kept (the same
+ *  reason as a failure: the question must stay recoverable), but the report is
+ *  not an error — the side panel's own standing "delivery not confirmed"
+ *  notice is set here, the SideChat transport policy for the same receipt. */
 export type SlashInterceptResult =
-  | { intercepted: true; failed?: boolean; error?: string; stage?: 'open' | 'turn' }
+  | { intercepted: true; failed?: boolean; error?: string; stage?: 'open' | 'turn'; unconfirmed?: boolean }
   | { intercepted: false }
 
 /** The message of a rejected side-chat request, for the caller's notice. The
@@ -71,8 +78,24 @@ export async function interceptSlashCommand(
   dispatch(openActivityToTab('side'))
   if (message) {
     let failed = false
+    let unconfirmed = false
     let error = ''
     await api.sideTurn(slot, message).catch((e: unknown) => {
+      // A 2xx whose body could not be read: the server PROBABLY took the turn
+      // -- but the outage that cut the body can also swallow the WS row that
+      // would show the question in the panel, and nothing replays it. Treating
+      // it as success cleared the composer, so the question could vanish from
+      // the UI entirely. Treated as UNCONFIRMED instead, the way SideChat treats
+      // the same receipt: the composer keeps the command (so nothing is lost)
+      // and the side panel stands its "delivery not confirmed" notice, which
+      // tells the user to look before resending rather than inviting a retry
+      // that runs the turn twice.
+      if (e instanceof AcceptedBodyUnreadable) {
+        failed = true
+        unconfirmed = true
+        dispatch(sideSendStatus({ slot, notice: { text: deliveryUnconfirmedCopy(true), restoredDraft: false } }))
+        return
+      }
       // Failure surfaces through `failed` so the caller can restore the
       // composer (e.g. 409: a side turn is already in flight, or 400: the
       // expanded question exceeds the byte limit), and through `error` so it
@@ -82,6 +105,7 @@ export async function interceptSlashCommand(
       failed = true
       error = failureMessage(e)
     })
+    if (unconfirmed) return { intercepted: true, failed: true, unconfirmed: true, stage: 'turn' }
     if (failed) return { intercepted: true, failed: true, error, stage: 'turn' }
   }
   return { intercepted: true }

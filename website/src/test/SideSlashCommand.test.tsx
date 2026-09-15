@@ -18,6 +18,7 @@ vi.mock('../api/client', () => ({
 }))
 
 import { interceptSlashCommand } from '../pages/chat/ChatInput'
+import { AcceptedBodyUnreadable } from '../api/apiError'
 
 const SLOT = 'test-slot-1'
 
@@ -113,6 +114,20 @@ describe('/side slash command interception', () => {
     mockSideOpen.mockRejectedValueOnce(new Error('boom'))
     const result = await interceptSlashCommand('/side', SLOT, store.dispatch)
     expect(result).toEqual({ intercepted: true, failed: true, error: 'boom', stage: 'open' })
+  })
+
+  it('a 2xx whose body was unreadable is UNCONFIRMED: the composer is kept, no error is reported, and the side panel stands its notice', async () => {
+    // The turn was probably taken, but the outage that cut the body can also
+    // swallow the WS row that would show the question -- so the command must
+    // not be cleared as a success, and must not be reported as a refusal
+    // either (a retry could run the turn twice). Same policy as SideChat.
+    mockSideTurn.mockRejectedValueOnce(new AcceptedBodyUnreadable(new TypeError('network error')))
+    const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true, unconfirmed: true, stage: 'turn' })
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.notice?.text).toMatch(/^Delivery not confirmed/)
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.error).toBeUndefined()
+    // The panel opened -- the notice has somewhere to show.
+    expect(store.getState().chat.activityTab).toBe('side')
   })
 
   it('reports failed when sideTurn rejects (e.g. 409 turn in flight)', async () => {
