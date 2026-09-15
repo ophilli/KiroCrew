@@ -182,7 +182,6 @@ function AiSuggestions({
               initial={reduce ? false : { opacity: 0, y: 4 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.25, ease: 'easeOut', delay: reduce ? 0 : i * 0.05 }}
-              whileHover={canWrite && !reduce ? { y: -1 } : undefined}
               onClick={() => onAccept(s.name)}
               disabled={!canWrite || pending}
               title={tip}

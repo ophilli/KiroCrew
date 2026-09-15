@@ -2462,9 +2462,8 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   border: 1.5px solid var(--warn); border-radius: 10px 10px 10px 2px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   cursor: pointer; padding: 0;
-  transition: background-color 0.12s ease, transform 0.12s ease, color 0.12s ease;
+  transition: background-color 0.12s ease, color 0.12s ease;
 }
-.mc-cmt-bubble:hover { transform: scale(1.1); }
 .mc-cmt-bubble.unread { background-color: var(--warn); color: var(--warn-fg, #1a1a1a); }
 .mc-cmt-bubble.active { background-color: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 
