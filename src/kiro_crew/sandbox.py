@@ -2993,6 +2993,11 @@ def _sandbox_policy():
 # unshare(2) flags for the userns probe.
 _CLONE_NEWUSER = 0x10000000
 _CLONE_NEWNS = 0x00020000
+# mount(2) flags for the probe's propagation step: the launcher's first mount is
+# ``mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)`` inside the fresh mount
+# namespace, so the probe performs exactly that call and nothing else.
+_PROBE_MS_REC = 0x4000
+_PROBE_MS_PRIVATE = 1 << 18
 
 # Errnos that indicate a TRANSIENT resource failure (fork/CDLL under momentary
 # pressure) — the kernel supports user namespaces, we just couldn't verify it
@@ -3021,8 +3026,19 @@ _WARM_JOIN_TIMEOUT_SECS = 2.0
 # momentary fd/disk pressure looks like, so the cap verdict stays TRANSIENT and
 # is never cached; the remedy travels with it so a host at a cap of 0 — which is
 # reported transient forever — still gets told which sysctl to raise.
+#
+# The third step is the launcher's FIRST mount: making propagation on ``/``
+# private inside the new mount namespace. Both unshare calls can succeed while
+# that mount is refused — a container whose runtime applies its default AppArmor
+# profile (``deny mount``) but no seccomp filter, the Kubernetes default on an
+# AppArmor node — and a probe that stopped at the unshares reported such a host
+# sandbox-capable, so every real spawn then died in the launcher with
+# ``sandbox: BLOCKED -- making mount propagation private on / failed: errno 13``
+# and was misread as a broken CLI. The probe therefore performs exactly that
+# mount, in a namespace that dies with the probe child, and nothing more.
 _PROBE_STEP_NEWUSER = "unshare(CLONE_NEWUSER)"
 _PROBE_STEP_NEWNS = "unshare(CLONE_NEWNS)"
+_PROBE_STEP_MOUNT_PRIVATE = "mount(MS_REC|MS_PRIVATE) on /"
 #: Wire step the probe child sends INSTEAD of "U" when its ``CLONE_NEWUSER`` EINVAL
 #: is explained by the child having been multithreaded, carrying the thread count.
 #: The parent classifies it exactly as it classifies a plain EINVAL -- the step
@@ -3092,12 +3108,13 @@ REMEDY_APPARMOR_USERNS = "apparmor_userns"  # Ubuntu >= 23.10 restricted profile
 REMEDY_MAX_USER_NAMESPACES = "max_user_namespaces"  # user.max_user_namespaces=0
 REMEDY_NO_USER_NS = "no_user_ns"  # kernel built without CONFIG_USER_NS
 REMEDY_USERNS_DENIED = "userns_denied"  # userns creation refused outright
+REMEDY_MOUNT_DENIED = "mount_denied"  # namespaces work; mount(2) refused inside them
 
 
 def _remedy_for_step(label: str, err: int) -> str:
-    """Name the host mechanism behind one failed unshare step.
+    """Name the host mechanism behind one failed probe step.
 
-    ``label`` is one of the two ``_PROBE_STEP_*`` constants for a real kernel
+    ``label`` is one of the ``_PROBE_STEP_*`` constants for a real kernel
     verdict; any other label is a harness failure (fork/pipe under pressure)
     which says nothing about the host and therefore has no remedy.
 
@@ -3105,7 +3122,17 @@ def _remedy_for_step(label: str, err: int) -> str:
     signature of Ubuntu's restricted-profile restriction rather than of userns
     being unavailable — the distinction that decides whether the fix is an
     AppArmor profile or a sysctl.
+
+    A refused propagation mount is only reachable after BOTH unshares succeeded:
+    the process holds every capability inside its new user namespace, so the
+    kernel itself never refuses this call — a policy layer did. EACCES is
+    AppArmor's answer (the container runtimes' default profile carries ``deny
+    mount``); EPERM is a seccomp filter's. Both are permanent for the life of
+    the container and share one remedy: relax that policy, or accept the
+    container as the only isolation boundary.
     """
+    if label == _PROBE_STEP_MOUNT_PRIVATE:
+        return REMEDY_MOUNT_DENIED if err in (errno.EACCES, errno.EPERM) else ""
     if label == _PROBE_STEP_NEWNS:
         return REMEDY_APPARMOR_USERNS if err == errno.EPERM else ""
     if label != _PROBE_STEP_NEWUSER:
@@ -3153,6 +3180,19 @@ _LINUX_REMEDY_GUIDANCE = {
         "kernel.unprivileged_userns_clone (it must be 1); inside a container "
         "this is usually the container's own seccomp filter denying unshare, "
         "which is fixed with container run flags rather than host config. "
+    ),
+    REMEDY_MOUNT_DENIED: (
+        "The user and mount namespaces were created, but making mount "
+        "propagation private on / inside them was refused, so the sandbox "
+        "cannot hide anything. Nothing in the kernel refuses this to a process "
+        "that owns the namespace: a policy layer did. Inside a container that is "
+        "the runtime's default AppArmor profile (it carries `deny mount`; "
+        "EACCES) or a seccomp filter without the mount family (EPERM). Run the "
+        "container with AppArmor unconfined (docker: --security-opt "
+        "apparmor=unconfined; Kubernetes: securityContext.appArmorProfile.type "
+        "Unconfined) and a seccomp profile that permits unshare and mount — no "
+        "root or CAP_SYS_ADMIN is needed — or accept the container as the only "
+        "isolation boundary with agent.sandbox_allow_unsandboxed_exec=true. "
     ),
 }
 
@@ -3330,6 +3370,39 @@ def _probe_child_unshare(libc: ctypes.CDLL, flags: int) -> int:
     return ctypes.get_errno() or errno.EPERM
 
 
+def _probe_child_make_private(libc: ctypes.CDLL) -> int:
+    """Make ``/`` recursively private in the probe child's new mount namespace.
+
+    Returns 0 or the errno, like :func:`_probe_child_unshare`, and is the same
+    seam for tests: the container shape ("both unshares ok, mount EACCES") is
+    simulated here rather than by running under a ``deny mount`` profile.
+
+    Runs ONLY after ``unshare(CLONE_NEWNS)`` succeeded, so the propagation
+    change is confined to a namespace no other process shares and that ends
+    with the child. Nothing is bind-mounted and no path is hidden: this is the
+    one mount the launcher performs before any of that, and the one a
+    container's policy refuses first.
+    """
+    ctypes.set_errno(0)
+    if libc.mount(None, b"/", None, _PROBE_MS_REC | _PROBE_MS_PRIVATE, None) == 0:
+        return 0
+    return ctypes.get_errno() or errno.EPERM
+
+
+def _probe_bind_libc(libc: ctypes.CDLL) -> None:
+    """Declare the two libc calls the probe child makes, for either probe path."""
+    libc.unshare.argtypes = [ctypes.c_int]
+    libc.unshare.restype = ctypes.c_int
+    libc.mount.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    ]
+    libc.mount.restype = ctypes.c_int
+
+
 def _probe_child_thread_count() -> int:
     """Live threads in the probe child, or 0 when it cannot be determined.
 
@@ -3481,7 +3554,14 @@ def _probe_child_sequence(
     p2c_w: int,
     sweep_ranges: tuple[tuple[int, int], ...],
 ) -> None:
-    """Probe child: run the launcher's two unshare steps, reporting each on the pipe.
+    """Probe child: run the launcher's namespace handshake, reporting each step.
+
+    Three steps, in the launcher's order: ``unshare(CLONE_NEWUSER)``, then —
+    once the parent has written the identity maps — ``unshare(CLONE_NEWNS)``,
+    then — once the parent has read that verdict — the propagation mount on
+    ``/``. Each step is one line on the pipe and the child waits for the parent
+    between them: a report and its successor written back to back could land in
+    the same read and the second would be lost.
 
     Never returns. It reports raw errnos and classifies nothing, so the entire
     verdict lives in the parent where a test can drive it without forking.
@@ -3510,7 +3590,13 @@ def _probe_child_sequence(
         # ordering is the entire point of the probe.
         if not os.read(p2c_r, 1):
             os._exit(0)  # parent abandoned the handshake; it already has a verdict
-        os.write(c2p_w, b"N:%d\n" % _probe_child_unshare(libc, _CLONE_NEWNS))
+        err = _probe_child_unshare(libc, _CLONE_NEWNS)
+        os.write(c2p_w, b"N:%d\n" % err)
+        if err:
+            os._exit(0)
+        if not os.read(p2c_r, 1):
+            os._exit(0)
+        os.write(c2p_w, b"P:%d\n" % _probe_child_make_private(libc))
         os._exit(0)
     except BaseException:
         os._exit(1)
@@ -3571,6 +3657,27 @@ def _probe_parent_sequence(
         return (False, True, f"probe child sent unexpected step {step!r}", "")
     if err:
         return _probe_failure(_PROBE_STEP_NEWNS, err)
+
+    # Release the child for the propagation mount only after its NEWNS report
+    # has been read: the two verdicts share one pipe and must not share a read.
+    try:
+        os.write(p2c_w, b"m")
+    except OSError as exc:
+        return _probe_harness_failure("probe handshake write", exc.errno or 0)
+
+    report = _probe_read_step(c2p_r)
+    if report is None:
+        return (
+            False,
+            True,
+            f"probe child {death(pid)}; no {_PROBE_STEP_MOUNT_PRIVATE} result",
+            "",
+        )
+    step, err = report
+    if step != "P":
+        return (False, True, f"probe child sent unexpected step {step!r}", "")
+    if err:
+        return _probe_failure(_PROBE_STEP_MOUNT_PRIVATE, err)
     return (True, False, "ok", "")
 
 
@@ -3622,6 +3729,8 @@ import ctypes, errno, os
 
 CLONE_NEWUSER = 0x10000000
 CLONE_NEWNS = 0x00020000
+MS_REC = 0x4000
+MS_PRIVATE = 1 << 18
 
 
 def threads():
@@ -3639,6 +3748,15 @@ def unshare(libc, flags):
     return ctypes.get_errno() or errno.EPERM
 
 
+def make_private(libc):
+    # The launcher's first mount, inside the namespace this child just created:
+    # nothing is bind-mounted or hidden, and the namespace ends with the child.
+    ctypes.set_errno(0)
+    if libc.mount(None, b"/", None, MS_REC | MS_PRIVATE, None) == 0:
+        return 0
+    return ctypes.get_errno() or errno.EPERM
+
+
 def main():
     try:
         # dlopen(NULL): resolve unshare() from the libc ALREADY loaded into this
@@ -3649,6 +3767,10 @@ def main():
         libc = ctypes.CDLL(None, use_errno=True)
         libc.unshare.argtypes = [ctypes.c_int]
         libc.unshare.restype = ctypes.c_int
+        libc.mount.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p,
+        ]
+        libc.mount.restype = ctypes.c_int
     except BaseException:
         os._exit(1)
     n = threads()
@@ -3661,17 +3783,24 @@ def main():
         os._exit(0)
     if not os.read(0, 1):
         os._exit(0)
-    os.write(1, b"N:%d\n" % unshare(libc, CLONE_NEWNS))
+    err = unshare(libc, CLONE_NEWNS)
+    os.write(1, b"N:%d\n" % err)
+    if err:
+        os._exit(0)
+    if not os.read(0, 1):
+        os._exit(0)
+    os.write(1, b"P:%d\n" % make_private(libc))
     os._exit(0)
 
 
 main()
 """
 
-#: Ceiling on the spawned probe. The child does two syscalls and one blocking read
-#: whose writer is this process, so anything near this is a wedged interpreter, not
-#: slow work. Exceeding it is reported TRANSIENT: a host that cannot start a Python
-#: in 20 seconds is under momentary pressure, not permanently sandbox-less.
+#: Ceiling on the spawned probe. The child does three syscalls and two blocking
+#: reads whose writer is this process, so anything near this is a wedged
+#: interpreter, not slow work. Exceeding it is reported TRANSIENT: a host that
+#: cannot start a Python in 20 seconds is under momentary pressure, not
+#: permanently sandbox-less.
 _PROBE_SPAWN_TIMEOUT_SECONDS = 20.0
 
 _probe_spawn_unavailable_logged = False
@@ -3759,20 +3888,25 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
 
     Mirrors the sequence ``_build_launcher_script()`` actually performs — fork,
     child ``unshare(CLONE_NEWUSER)``, parent writes the identity UID/GID map,
-    child ``unshare(CLONE_NEWNS)`` — because the two flags do NOT behave the
-    same way when combined. A single ``unshare(CLONE_NEWUSER | CLONE_NEWNS)`` is
-    satisfied atomically and therefore SUCCEEDS on hosts where the split
-    sequence fails: with Ubuntu's ``kernel.apparmor_restrict_unprivileged_userns
-    = 1`` (the default since 23.10), creating a user namespace moves the process
-    into a restricted AppArmor profile carrying no CAP_SYS_ADMIN, so the
-    *second* unshare returns EPERM. The previous combined probe reported those
-    hosts as sandbox-capable and every real spawn then died with
-    ``sandbox: unshare(NEWNS) failed: errno 1``.
+    child ``unshare(CLONE_NEWNS)``, child ``mount(MS_REC|MS_PRIVATE)`` on ``/``
+    — because the steps do NOT behave the same way when combined or skipped. A
+    single ``unshare(CLONE_NEWUSER | CLONE_NEWNS)`` is satisfied atomically and
+    therefore SUCCEEDS on hosts where the split sequence fails: with Ubuntu's
+    ``kernel.apparmor_restrict_unprivileged_userns = 1`` (the default since
+    23.10), creating a user namespace moves the process into a restricted
+    AppArmor profile carrying no CAP_SYS_ADMIN, so the *second* unshare returns
+    EPERM. The previous combined probe reported those hosts as sandbox-capable
+    and every real spawn then died with ``sandbox: unshare(NEWNS) failed: errno
+    1``. The propagation mount is the same story one step later: a container
+    under its runtime's default AppArmor profile passes both unshares and
+    refuses the mount with EACCES, and a probe that stopped at the unshares
+    reported it sandbox-capable too.
 
     ``reason`` names the failing step so a caller can tell the mechanisms apart
-    — a NEWNS denial is the AppArmor userns restriction, whereas NEWUSER with
-    ENOSPC/EUSERS is ``user.max_user_namespaces=0`` — rather than reporting a
-    bare errno that fits both.
+    — a NEWNS denial is the AppArmor userns restriction, NEWUSER with
+    ENOSPC/EUSERS is ``user.max_user_namespaces=0``, and a mount denial is the
+    container runtime's policy — rather than reporting a bare errno that fits
+    all of them.
 
     Linux-only and off-loop only: ``_probe_unshare()`` guards the platform and
     defers to the background warm thread when a loop is running, so the fork,
@@ -3780,8 +3914,7 @@ def _probe_unshare_via_fork() -> tuple[bool, bool, str, str]:
     """
     try:
         libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        libc.unshare.argtypes = [ctypes.c_int]
-        libc.unshare.restype = ctypes.c_int
+        _probe_bind_libc(libc)
     except OSError as exc:
         return (False, exc.errno in _TRANSIENT_PROBE_ERRNOS, f"libc load failed: {exc}", "")
     except Exception as exc:  # find_library returning junk, ABI issues, ...
@@ -3990,7 +4123,14 @@ def _probe_unshare() -> bool:
 
 
 def userns_available() -> bool:
-    """Public: True if unprivileged user + mount namespaces work on this host.
+    """Public: True if this host can build the launcher's namespace sandbox.
+
+    "Build" means the whole handshake the launcher performs before it hides
+    anything: an unprivileged user namespace, a mount namespace inside it, and
+    a private propagation mount on ``/`` inside that. A host that grants the
+    namespaces but refuses the mount (a container under its runtime's default
+    AppArmor profile) is NOT sandbox-capable, and reporting it as such made
+    every real spawn die in the launcher instead.
 
     Stable cross-module entry point for the namespace-support probe, shared by
     the OS-level sandbox here and the JailProvider extension point
@@ -8355,6 +8495,139 @@ class SandboxUnavailableError(RuntimeError):
         self.remedy = remedy
 
 
+#: Leading text of every line the Linux launcher writes when it ends WITHOUT
+#: exec'ing its child: ``_mount_or_die`` and the seccomp/prctl installs say
+#: ``sandbox: BLOCKED``, the two unshare steps say ``sandbox: unshare(``, a
+#: broken parent/child handshake or an unreadable ``known_hosts`` says
+#: ``sandbox: FATAL``, and a launcher invoked with no command says
+#: ``sandbox_launcher:``. The launcher is the only Kiro Crew code that writes
+#: a line shaped this way to a child's stderr, and it exits right after, so a
+#: refused child's captured output carries exactly one of these. Public because
+#: it is the ONE definition every consumer keys on — :func:`launcher_refusal`
+#: here and the clone probe's exit classifier in
+#: ``apps/builtins/auto_improvement/backend/clone_setup.py`` — and each prefix
+#: is pinned against the generated launcher by a round-trip test so the tuple
+#: cannot drift from the script that emits it. ``sandbox: WARNING`` is
+#: deliberately absent: the launcher warns and then still runs the child.
+LAUNCHER_EXIT_PREFIXES = (
+    "sandbox: BLOCKED",
+    "sandbox: FATAL",
+    "sandbox: unshare(",
+    "sandbox_launcher:",
+)
+_LAUNCHER_REFUSAL_RE = re.compile(
+    r"^sandbox: (?:BLOCKED (?:--|—) )?(?P<what>.+?) failed: errno (?P<errno>\d+)"
+)
+
+
+def launcher_refusal(output: str) -> tuple[str, str, str] | None:
+    """Classify the launcher's OWN refusal line in a refused child's output.
+
+    ``wrap_argv`` raises :class:`SandboxUnavailableError` when the sandbox
+    cannot be built BEFORE the spawn. The launcher can also refuse AFTER it — a
+    host that passed the probe can still deny a control at spawn time, and a
+    probe result cached under one policy can outlive a policy change. That
+    refusal reaches the caller only as a non-zero exit with the launcher's line
+    in the captured stderr, which every caller so far read as "the child is
+    broken": a present, signed-in kiro-cli was reported as not installed because
+    a container refused the launcher's first mount.
+
+    Returns the same ``(kind, detail, remedy)`` triple the typed error carries,
+    or ``None`` when *output* holds no launcher refusal. Keys ONLY on the
+    launcher's fixed prefixes, never on host capability.
+
+    **The line is untrusted, and this function is the CLASSIFIER, not the
+    verdict.** The child the launcher would have exec'd is the unverified
+    candidate itself, running inside the sandbox this module built, and a
+    planted binary can print the same prefix to stderr and exit 1. A caller that
+    reported this triple as a sandbox verdict would let that binary make the
+    first-run gate announce "sandbox unavailable" and hand the operator the
+    opt-out that disables the isolation it is running under. Callers deciding a
+    verdict use :func:`corroborate_launcher_refusal`, which asks the host again
+    and reports what the PROBE found; this function is for messaging (a
+    diagnostic that quotes the line) and for that corroboration's hint.
+
+    * A refused ``mount(2)`` or ``unshare(2)`` is ``no_backend`` — the host
+      cannot build the sandbox — and its errno is classified exactly as the
+      probe classifies the same step, so the remedy names the same mechanism
+      (a hiding mount refused with EACCES is the same policy that refuses the
+      propagation mount, so it shares :data:`REMEDY_MOUNT_DENIED`).
+    * The seccomp/prctl installs are ``no_backend`` with no mechanism token: the
+      host offers no way to apply the filter.
+    * A broken parent/child handshake (``FATAL ... did not publish``) is
+      ``transient``: the pipe protocol failed, which says nothing about the
+      host and self-heals on the next spawn.
+    * A refusal about HOST STATE is NOT a sandbox failure at all — a hardlinked
+      credential, an unreadable ``known_hosts``: the sandbox worked and found
+      something it must not paper over. Reported as ``None`` so the launcher's
+      line reaches the operator as the child's own complaint, which names the
+      file to fix. A launcher invoked with no command (``sandbox_launcher:``)
+      is the caller's defect, ``None`` for the same reason. Advisory
+      ``sandbox: WARNING`` lines never match: the launcher continued past them.
+    """
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line.startswith(LAUNCHER_EXIT_PREFIXES):
+            continue
+        if line.startswith("sandbox_launcher:"):
+            return None
+        if line.startswith("sandbox: FATAL"):
+            return ("transient", line, "") if "did not publish" in line else None
+        if "hardlink" in line:
+            return None
+        match = _LAUNCHER_REFUSAL_RE.match(line)
+        if match is None:
+            return ("no_backend", line, "")
+        what = match.group("what")
+        err = int(match.group("errno"))
+        if what.startswith("unshare(NEWUSER)"):
+            step = _PROBE_STEP_NEWUSER
+        elif what.startswith("unshare(NEWNS)"):
+            step = _PROBE_STEP_NEWNS
+        else:
+            step = _PROBE_STEP_MOUNT_PRIVATE
+        return ("no_backend", line, _remedy_for_step(step, err))
+    return None
+
+
+def corroborate_launcher_refusal(output: str) -> tuple[str, str, str] | None:
+    """A post-spawn sandbox verdict for a refused child — from the PROBE, or ``None``.
+
+    The launcher's refusal line (:func:`launcher_refusal`) is the only signal a
+    post-spawn refusal leaves, and it cannot be trusted on its own: the child
+    is the unverified candidate, and a planted ``kiro-cli`` can print the same
+    line. So the line decides only WHETHER to ask the host again. The verdict,
+    its detail and its remedy all come from this module's own namespace probe,
+    which never runs the candidate — the same authority the boot-time verdict
+    rests on.
+
+    * No launcher line in *output*: ``None`` without probing.
+    * A line, and the probe still builds the sandbox: ``None``. The line was
+      forged, or the refusal was momentary; either way the text reaches the
+      operator as the child's own complaint, never as a sandbox verdict.
+    * A line, and the probe fails: the probe's ``(kind, reason, remedy)``,
+      classified exactly as ``wrap_argv`` classifies a pre-spawn refusal. This
+      is also how a policy change after boot becomes visible — the boot verdict
+      is cached, this probe is fresh.
+
+    Linux only: the prefixes are the Linux launcher's and the probe is
+    Linux-only, so on any other platform a matching line can only be the
+    child's own text. The probe forks and waits on a pipe, so this blocks; a
+    caller on an event loop runs it in a thread. It reads the backend cache
+    for nothing and writes nothing to it: a spawn's report must not let a
+    child's output move a process-wide verdict, even by way of a real probe.
+    """
+    if launcher_refusal(output) is None:
+        return None
+    if sys.platform != "linux":
+        return None
+    ok, transient, reason, remedy = _probe_unshare_once()
+    if ok:
+        return None
+    return (_classify_unavailable(transient), reason, remedy)
+    return None
+
+
 def reset_backend() -> None:
     """Reset cached backend (for testing or config change)."""
     global _backend, _last_unshare_failure
@@ -9020,34 +9293,66 @@ def wrap_argv(
                 )
             elif is_docker_container():
                 # Inside a Docker/OCI container the runtime's seccomp or
-                # AppArmor policy blocked unshare(CLONE_NEWUSER).  This is a
-                # container-policy restriction, NOT a kernel-level limitation
-                # on the host — the correct fix is at the container level, not
-                # disabling the sandbox everywhere.
-                guidance = (
-                    "Running inside a Docker/OCI container where the runtime's "
-                    "seccomp or AppArmor policy blocks user namespace creation "
-                    f"(probe: {probe_reason}). "
-                    "This is a container policy restriction, not a host kernel "
-                    "limitation. To resolve, choose one of:\n"
-                    "  (a) Use the Kiro Crew custom seccomp profile (adds "
-                    "unconditional unshare/clone/mount allows to the Docker "
-                    "default — less permissive than seccomp=unconfined):\n"
-                    "        # With a repo checkout:\n"
-                    "        docker run --security-opt "
-                    "seccomp=docker/seccomp/kirocrew-seccomp.json ...\n"
-                    "        # Without a checkout (image-only):\n"
-                    "        curl -fsSL https://raw.githubusercontent.com/"
-                    "kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json"
-                    " -o kirocrew-seccomp.json\n"
-                    "        docker run --security-opt seccomp=kirocrew-seccomp.json ...\n"
-                    "  (b) Restart with explicit unsandboxed consent "
-                    "(the container is then the only isolation boundary):\n"
-                    "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
-                    "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
-                    "in ~/.kiro/crew/config.json inside the container.\n"
-                    "See docs/guides/docker.md for the full sandbox troubleshooting guide."
-                )
+                # AppArmor policy blocked a step of the namespace handshake.
+                # This is a container-policy restriction, NOT a kernel-level
+                # limitation on the host — the correct fix is at the container
+                # level, not disabling the sandbox everywhere.
+                #
+                # WHICH step decides the advice. A refused unshare is seccomp
+                # (Docker's default profile gates it on CAP_SYS_ADMIN) and the
+                # shipped seccomp profile fixes it. A refused propagation MOUNT
+                # after both unshares succeeded is the runtime's default
+                # AppArmor profile (`deny mount`) — the Kubernetes default on an
+                # AppArmor node, where no seccomp profile is applied at all — and
+                # a seccomp profile cannot fix that, so prescribing one would
+                # send the operator through a change that leaves the probe
+                # failing exactly as before.
+                if probe_remedy == REMEDY_MOUNT_DENIED:
+                    guidance = (
+                        "Running inside a Docker/OCI container whose runtime "
+                        "policy permits user namespaces but refuses mount(2) "
+                        f"inside them (probe: {probe_reason}). This is the "
+                        "runtime's default AppArmor profile (`deny mount`) or a "
+                        "seccomp filter, not a host kernel limitation, and it "
+                        "needs no root or CAP_SYS_ADMIN to fix. Choose one of:\n"
+                        "  (a) Run the container with AppArmor unconfined, and a "
+                        "seccomp profile that permits unshare and mount:\n"
+                        "        docker run --security-opt apparmor=unconfined "
+                        "--security-opt seccomp=kirocrew-seccomp.json ...\n"
+                        "        # Kubernetes: securityContext.appArmorProfile: "
+                        "{type: Unconfined}\n"
+                        "  (b) Restart with explicit unsandboxed consent "
+                        "(the container is then the only isolation boundary):\n"
+                        "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
+                        "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
+                        "in ~/.kiro/crew/config.json inside the container.\n"
+                        "See docs/guides/docker.md for the full sandbox troubleshooting guide."
+                    )
+                else:
+                    guidance = (
+                        "Running inside a Docker/OCI container where the runtime's "
+                        "seccomp or AppArmor policy blocks user namespace creation "
+                        f"(probe: {probe_reason}). "
+                        "This is a container policy restriction, not a host kernel "
+                        "limitation. To resolve, choose one of:\n"
+                        "  (a) Use the Kiro Crew custom seccomp profile (adds "
+                        "unconditional unshare/clone/mount allows to the Docker "
+                        "default — less permissive than seccomp=unconfined):\n"
+                        "        # With a repo checkout:\n"
+                        "        docker run --security-opt "
+                        "seccomp=docker/seccomp/kirocrew-seccomp.json ...\n"
+                        "        # Without a checkout (image-only):\n"
+                        "        curl -fsSL https://raw.githubusercontent.com/"
+                        "kirodotdev/KiroCrew/main/docker/seccomp/kirocrew-seccomp.json"
+                        " -o kirocrew-seccomp.json\n"
+                        "        docker run --security-opt seccomp=kirocrew-seccomp.json ...\n"
+                        "  (b) Restart with explicit unsandboxed consent "
+                        "(the container is then the only isolation boundary):\n"
+                        "        docker run -e KIROCREW_ALLOW_UNSANDBOXED=1 ...\n"
+                        "  (c) Manually set agent.sandbox_allow_unsandboxed_exec=true "
+                        "in ~/.kiro/crew/config.json inside the container.\n"
+                        "See docs/guides/docker.md for the full sandbox troubleshooting guide."
+                    )
             else:
                 guidance = _no_backend_guidance()
             # When the policy floor is what refused, every guidance above points
