@@ -22,7 +22,7 @@ import subprocess
 import sys
 import textwrap
 from dataclasses import fields
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -966,22 +966,55 @@ def test_the_model_select_fold_matches_the_advertised_selection_table(backend):
 
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-def test_unprojected_pooled_mcp_is_refused_for_exactly_the_mirrored_hosts(backend):
-    """H6: pooled servers are refused iff this host's MCP surface needs a projection.
+def test_the_session_mcp_array_is_mirror_built_for_exactly_the_mirrored_hosts(backend):
+    """H6: the runtime builds its array through a projection iff the host has a mirror.
 
     Read from the mirror registry rather than from a backend name, so a host added to
-    ``providers.mirrors`` inherits the refusal instead of the gap.
+    ``providers.mirrors`` inherits the projection instead of reaching ``session/new``
+    with an array nothing narrowed. The host that needs one is the host whose MCP
+    surface Crew describes rather than the host that reaches its servers natively, and
+    that is exactly what the registry answers.
+
+    The mirror is a recording double, so this asserts the ROUTE for every known
+    backend without standing up seven real agent specs. Each real mirror's own
+    projection is pinned by its own module's tests.
     """
-    from kiro_crew.acp.client import AcpToolGateUnroutable
+    import asyncio
+
+    from kiro_crew.providers.mirrors.base import SessionProjection
+
+    projected: list[dict] = []
+
+    class _Recording:
+        def session_projection(self, agent, **kwargs):
+            projected.append(kwargs)
+            return SessionProjection(params={"mcpServers": [{"name": "projected"}]})
 
     rt = _runtime_for(backend)
-    rt._refuse_unprojected_pooled_servers([])  # empty never refuses, for any host
-    pooled = [{"name": "brokered", "command": "x"}]
-    if mirrors.has_mirror(backend):
-        with pytest.raises(AcpToolGateUnroutable):
-            rt._refuse_unprojected_pooled_servers(pooled)
-    else:
-        rt._refuse_unprojected_pooled_servers(pooled)
+    with (
+        patch.object(acp_runtime, "mirror_for", lambda _b: _Recording()),
+        patch.object(acp_runtime, "pooled_session_servers", lambda *a, **k: [{"name": "brokered"}]),
+        patch.object(acp_runtime, "injection_server_names", lambda *a, **k: frozenset()),
+    ):
+        out = asyncio.run(
+            rt._mirrored_session_mcp(
+                "kirocrew", work_dir="/tmp", session_key="s-parity", channel_id="c-parity"
+            )
+        )
+    mirrored = mirrors.has_mirror(backend)
+    assert (out is not None) is mirrored
+    # Not just the return: a host that reached the projection and then discarded it
+    # would pass the line above on a None, and one that skipped it would pass on an
+    # array. Both halves are the answer.
+    assert bool(projected) is mirrored
+    if mirrored:
+        # The identity a mirrored host can receive no other way -- a codex stdio
+        # server starts from env_clear() plus an allowlist.
+        assert projected[0]["session_key"] == "s-parity"
+        assert projected[0]["channel_id"] == "c-parity"
+        # This runtime authors no native permission file, so a mirror in claude's
+        # class must fail closed here rather than deliver tools Crew cannot gate.
+        assert projected[0]["permission_surface_owned"] is False
 
 
 def test_every_runtime_path_identity_test_is_declared():
