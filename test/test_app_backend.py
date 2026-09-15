@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,6 +25,44 @@ from kiro_crew.apps.backend import (
     stop_app_backend,
 )
 from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
+
+
+def _retire_probe_sel(probe_home: str) -> None:
+    """Tear down a ``SecurityEventLog`` singleton that ``_sandbox_can_spawn`` built.
+
+    Only an instance bound INSIDE *probe_home* is touched: one the operator's
+    process already held (a ``base_dir`` instance from a sibling module, say)
+    is not the probe's to retire. Flush, send the writer its shutdown sentinel
+    and join it -- the same idiom as ``test_sel._shutdown_writer`` -- so no
+    thread survives holding the chain-lock fd or a reference to the directory
+    about to be removed, then clear the class slots so the first test's
+    ``sel()`` rebuilds under the session floor's redirected default dir.
+    """
+    from kiro_crew.sel import SecurityEventLog
+
+    inst = SecurityEventLog._instance
+    if inst is None:
+        return
+    bound = getattr(inst, "_dir", None)
+    if not getattr(inst, "_initialized", False) or bound is None:
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
+        return
+    try:
+        inside = Path(bound).resolve().is_relative_to(Path(probe_home).resolve())
+    except OSError:
+        inside = False
+    if not inside:
+        return
+    try:
+        inst.flush()
+        inst._queue.put(None)
+        writer = inst._writer
+        if writer is not None:
+            writer.join(timeout=5)
+    finally:
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
 
 
 def _sandbox_can_spawn() -> bool:
@@ -49,6 +88,19 @@ def _sandbox_can_spawn() -> bool:
     backend at all, and every test it gates then failed closed under the
     fixture's default config, while CI (no operator config) skipped them. The
     gate must observe what the tests will observe: the default config.
+
+    The probe also RETIRES the Security Event Log it constructs. On a host with
+    no sandbox backend ``wrap_argv()`` fail-closes and records a ``denied``
+    audit through ``sel()`` -- a process SINGLETON whose ``_dir`` is bound once,
+    here from ``empty_home``. Left in place, that instance (a) keeps the chain
+    lock / log open long enough on Windows that ``TemporaryDirectory`` cannot
+    remove ``empty_home`` -- the failure lands in the bare ``except`` below and
+    the directory leaks at the TEMP root, one per xdist worker, holding a
+    ``security_events.jsonl`` and a ``trust/sel_hmac.key`` -- and (b) outlives
+    the probe: the rootdir ``_isolate_sel_default_dir`` floor only resets the
+    singleton at the first test's setup, and any SEL write before that (or a
+    write on the retired writer thread) ``mkdir``s the deleted home back into
+    existence. MEASURED: five full runs each left ten such directories.
     """
     try:
         from kiro_crew import sandbox as _sb
@@ -63,6 +115,7 @@ def _sandbox_can_spawn() -> bool:
                     os.environ.pop("KIROCREW_HOME", None)
                 else:
                     os.environ["KIROCREW_HOME"] = saved
+                _retire_probe_sel(empty_home)
     except Exception:  # noqa: BLE001 — any probe failure => treat as "can't spawn"
         return False
     try:
