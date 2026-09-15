@@ -17,6 +17,7 @@ import { useAppSelector } from '../../store'
 import { serializeDefaultMemoryModeUpdate } from '../../api/queryClient'
 import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
+import { mergeReorderedNames } from '../../providers/modelList'
 import { usePlainDiff } from '../../hooks/usePlainDiff'
 import { useDiffSplit } from '../../hooks/useDiffSplit'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
@@ -142,6 +143,7 @@ type KirocrewConfigShape = {
   session_summary?: { enabled?: boolean }
   agent?: {
     model?: string
+    model_order?: string[]
     role_models?: { background?: string; subagent?: string }
     role_efforts?: { background?: string; subagent?: string }
     reasoning_effort?: string
@@ -835,6 +837,29 @@ export function ChatPanel() {
       : [...hiddenModels.filter(value => value !== model), model]
     saveHiddenModels(selected ? { next, remove: [model] } : { next, add: [model] })
   }
+  // ── Model order (agent.model_order) ──
+  // The same rows carry ordering: a drag writes the merged order through the
+  // shared optimistic overlay, so the list re-sorts before the PATCH lands
+  // (useAvailableModelsQuery re-derives from the ['kirocrewConfig'] cache).
+  // `mergeReorderedNames` keeps saved ids the live list does not currently
+  // advertise — kiro renames models, and a drag must not delete them.
+  const savedModelOrder = mcCfg?.agent?.model_order ?? []
+  const modelOrderOpts = overlay.mutationOpts<string[]>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: (v: string[]) => api.patchConfig('agent.model_order', v),
+    path: () => 'agent.model_order',
+    displayValue: v => v.join(', '),
+    applyToCache: (cached, v) => setConfigPathValue(cached as KirocrewConfigShape, 'agent.model_order', v),
+    onFailure: () => setPathSaveError('agent.model_order', i18nT('settings.chat.modelOrder.saveFailed')),
+    onSupersede: clearOwnPathError,
+  })
+  const modelOrderMut = useMutation({
+    ...modelOrderOpts,
+    // Serialized like hidden-models above: drags land in UI order.
+    scope: { id: 'agent.model_order' },
+  })
+  const reorderModels = (ordered: string[]) =>
+    modelOrderMut.mutate(mergeReorderedNames(savedModelOrder, ordered))
   const advertisedModelIds = new Set(availableModels.map(model => model.name))
   const hiddenUnadvertisedModels = hiddenModels.filter(model => !advertisedModelIds.has(model))
   const advertisedOptionalModelIds = availableModels.filter(model => model.name !== 'auto').map(model => model.name)
@@ -1044,7 +1069,14 @@ export function ChatPanel() {
                 label: i18nT('components.multiSelect.deselect_all'),
                 onSelect: deselectAllModels,
               },
+              {
+                label: i18nT('settings.chat.modelOrder.reset'),
+                onSelect: () => modelOrderMut.mutate([]),
+              },
             ]}
+            onReorder={reorderModels}
+            reorderDisabled={!mcQ.isSuccess || availableModelsQ.isDegraded}
+            reorderRowLabel={name => i18nT('settings.chat.modelOrder.reorder', { model: name })}
             summary={modelPickerSummary}
             searchPlaceholder={i18nT('pages.settings.chatPanel.search_models')}
             disabled={!dashQ.isSuccess || !availableModelsQ.isSuccess || availableModelsQ.isDegraded}
